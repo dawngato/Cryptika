@@ -1,0 +1,206 @@
+// data/repository/AuthRepositoryImpl.kt
+package com.cryptika.messenger.data.repository
+
+import android.util.Base64
+import com.cryptika.messenger.data.local.AuthStore
+import com.cryptika.messenger.data.remote.ServerConfig
+import com.cryptika.messenger.data.remote.api.*
+import com.cryptika.messenger.domain.crypto.IdentityKeyManager
+import com.cryptika.messenger.domain.repository.AuthRepository
+import com.cryptika.messenger.domain.repository.IdentityRepository
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import retrofit2.HttpException
+import java.security.MessageDigest
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class AuthRepositoryImpl @Inject constructor(
+    private val authApi: AuthApi,
+    private val authStore: AuthStore,
+    private val serverConfig: ServerConfig,
+    private val identityRepository: IdentityRepository,
+    private val identityKeyManager: IdentityKeyManager? = null
+) : AuthRepository {
+
+    constructor(
+        authApi: AuthApi,
+        authStore: AuthStore,
+        serverConfig: ServerConfig,
+        identityRepository: IdentityRepository
+    ) : this(authApi, authStore, serverConfig, identityRepository, null)
+
+    private fun authHeader(): String = "Bearer ${authStore.jwtToken.orEmpty()}"
+
+    override suspend fun enter(username: String): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            try {
+                // Use existing local identity or generate a new one if not present
+                val identity = identityRepository.getLocalIdentity() ?: identityRepository.generateIdentity()
+                val now = System.currentTimeMillis()
+                val payload = "Cryptika-Auth:$username:$now".toByteArray(Charsets.UTF_8)
+                val payloadHash = MessageDigest.getInstance("SHA-256").digest(payload)
+                val signatureBytes = identityKeyManager?.sign(payloadHash) ?: identityRepository.sign(payloadHash)
+                val signatureB64 = Base64.encodeToString(signatureBytes, Base64.NO_WRAP)
+
+                val response = authApi.enter(
+                    url = "${serverConfig.apiBaseUrl}/api/v1/auth/enter",
+                    request = EnterRequest(
+                        username = username,
+                        identityHashHex = identity.identityHex,
+                        publicKeyB64 = Base64.encodeToString(identity.publicKeyBytes, Base64.NO_WRAP),
+                        signatureB64 = signatureB64,
+                        timestampMs = now
+                    )
+                )
+                authStore.credentialsBurned = false
+                authStore.jwtToken = response.token
+                authStore.contactToken = response.contactToken
+                authStore.username = username
+                authStore.tokenExpiresAt = response.expiresAt
+                Result.success(Unit)
+            } catch (e: HttpException) {
+                val errorBody = e.response()?.errorBody()?.string()
+                val msg = try {
+                    JSONObject(errorBody ?: "").optString("error", "Entry failed")
+                } catch (_: Exception) { "Entry failed" }
+                Result.failure(Exception(msg))
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+
+    override fun isLoggedIn(): Boolean = authStore.isLoggedIn
+
+    override fun getUsername(): String? = authStore.username
+
+    override fun getContactToken(): String? = authStore.contactToken
+
+    override fun getJwtToken(): String? = authStore.jwtToken
+
+    override fun logout() {
+        authStore.clear()
+        // Do NOT delete the identity on logout: callers with saved contacts would
+        // fail Ed25519 signature checks after re-login, silently breaking calls and
+        // messages. Identity rotation is an explicit, user-initiated operation via
+        // Settings → Regenerate Identity.
+    }
+
+    override suspend fun sendContactRequest(targetUsername: String, nickname: String): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            try {
+                val identity = identityRepository.getLocalIdentity()
+                authApi.sendContactRequest(
+                    url = "${serverConfig.apiBaseUrl}/api/v1/contact/request",
+                    auth = authHeader(),
+                    request = ContactRequestBody(
+                        targetUsername = targetUsername,
+                        nickname = nickname,
+                        identityHashHex = identity?.identityHex,
+                        publicKeyB64 = identity?.let { Base64.encodeToString(it.publicKeyBytes, Base64.NO_WRAP) }
+                    )
+                )
+                Result.success(Unit)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+
+    override suspend fun sendContactRequestByFingerprint(targetIdentityHash: String, nickname: String): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            try {
+                val identity = identityRepository.getLocalIdentity()
+                authApi.sendContactRequestByFingerprint(
+                    url = "${serverConfig.apiBaseUrl}/api/v1/contact/request-by-fingerprint",
+                    auth = authHeader(),
+                    request = ContactRequestByFingerprintBody(
+                        targetIdentityHash = targetIdentityHash,
+                        nickname = nickname,
+                        identityHashHex = identity?.identityHex,
+                        publicKeyB64 = identity?.let { Base64.encodeToString(it.publicKeyBytes, Base64.NO_WRAP) }
+                    )
+                )
+                Result.success(Unit)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+
+    override suspend fun getPendingRequests(): Result<List<PendingRequest>> =
+        withContext(Dispatchers.IO) {
+            try {
+                val response = authApi.getPendingRequests(
+                    url = "${serverConfig.apiBaseUrl}/api/v1/contact/requests",
+                    auth = authHeader()
+                )
+                Result.success(response.requests)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+
+    override suspend fun acceptRequest(requestId: String): Result<AcceptRequestResponse> =
+        withContext(Dispatchers.IO) {
+            try {
+                val identity = identityRepository.getLocalIdentity()
+                val response = authApi.acceptContactRequest(
+                    url = "${serverConfig.apiBaseUrl}/api/v1/contact/accept",
+                    auth = authHeader(),
+                    request = AcceptRequestBody(
+                        requestId = requestId,
+                        identityHashHex = identity?.identityHex,
+                        publicKeyB64 = identity?.let { Base64.encodeToString(it.publicKeyBytes, Base64.NO_WRAP) }
+                    )
+                )
+                Result.success(response)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+
+    override suspend fun rejectRequest(requestId: String): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            try {
+                authApi.rejectContactRequest(
+                    url = "${serverConfig.apiBaseUrl}/api/v1/contact/reject",
+                    auth = authHeader(),
+                    request = RejectRequestBody(requestId)
+                )
+                Result.success(Unit)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+
+    override suspend fun getAcceptedSessions(): Result<List<AcceptedSession>> =
+        withContext(Dispatchers.IO) {
+            try {
+                val response = authApi.getAcceptedSessions(
+                    url = "${serverConfig.apiBaseUrl}/api/v1/contact/accepted",
+                    auth = authHeader()
+                )
+                Result.success(response.sessions)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+
+    override suspend fun burnCredentials(): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            try {
+                authApi.burnCredentials(
+                    url = "${serverConfig.apiBaseUrl}/api/v1/auth/burn",
+                    auth = authHeader(),
+                    request = BurnRequestBody(forceDisconnect = true)
+                )
+                authStore.burnCredentials()
+                Result.success(Unit)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+
+    override fun isCredentialsBurned(): Boolean = authStore.credentialsBurned
+}
